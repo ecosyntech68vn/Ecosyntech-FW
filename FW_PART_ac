@@ -1,0 +1,400 @@
+    if (!mqttConnected) return;
+    String topic = String("ecosyntech/") + CFG.deviceId + "/sensor";
+    if (mqttClient.publish(topic.c_str(), payload.c_str())) {
+        METRICS.mqttPublishCount++;
+        Serial.println("[MQTT] Sensor data published");
+    } else {
+        Serial.println("[MQTT] Publish failed");
+        METRICS.consecutiveMqttFails++;
+    }
+}
+
+void mqttPublishHeartbeat() {
+    if (!mqttConnected) return;
+    String topic = String("ecosyntech/") + CFG.deviceId + "/heartbeat";
+    // buildHeartbeatPayload defined later
+    String hb = buildHeartbeatPayload();   // forward declaration resolved later
+    if (mqttClient.publish(topic.c_str(), hb.c_str())) {
+        Serial.println("[MQTT] Heartbeat published");
+    } else {
+        METRICS.consecutiveMqttFails++;
+    }
+}
+
+void mqttSubscribeCommands() {
+    if (!mqttConnected) return;
+    String topic = String("ecosyntech/") + CFG.deviceId + "/command";
+    if (mqttClient.subscribe(topic.c_str())) {
+        Serial.printf("[MQTT] Subscribed to %s\n", topic.c_str());
+    } else {
+        Serial.println("[MQTT] Subscribe failed");
+    }
+}
+
+void mqttReconnect() {
+    if (!DYN_CFG.mqtt_enabled) return;
+    if (mqttConnected) return;
+    unsigned long now = millis();
+    if (now - lastMqttReconnectAttempt < MQTT_RECONNECT_DELAY_MS) return;
+    lastMqttReconnectAttempt = now;
+    Serial.println("[MQTT] Attempting reconnect...");
+    if (DYN_CFG.mqtt_tls) {
+        mqttSecureClient.setInsecure(); // In production, use proper cert
+        mqttClient.setClient(mqttSecureClient);
+    } else {
+        mqttClient.setClient(mqttPlainClient);
+    }
+    mqttClient.setServer(DYN_CFG.mqtt_broker, DYN_CFG.mqtt_port);
+    mqttClient.setCallback(mqttCallback);
+    if (mqttClient.connect(CFG.deviceId, DYN_CFG.mqtt_user, DYN_CFG.mqtt_pass)) {
+        mqttConnected = true;
+        METRICS.mqttReconnectCount++;
+        METRICS.consecutiveMqttFails = 0;
+        Serial.println("[MQTT] Connected");
+        mqttSubscribeCommands();
+        mqttClient.publish(String("ecosyntech/") + CFG.deviceId + "/status", "online", true);
+    } else {
+        mqttConnected = false;
+        METRICS.consecutiveMqttFails++;
+        Serial.printf("[MQTT] Failed, rc=%d\n", mqttClient.state());
+    }
+}
+
+void processMqtt() {
+    if (!DYN_CFG.mqtt_enabled) return;
+    if (!mqttConnected) {
+        mqttReconnect();
+    } else {
+        mqttClient.loop();
+    }
+}
+
+// ============================ Networking (HTTPS) ============================
+String getDeviceSecret() { return String(CFG.hmacSecret); }
+String getBaseUrl() { return String(CFG.webhookUrl); }
+String getConfigUrl() { return String(CFG.getBatchUrl); }
+String getOtaUrl() { return String(CFG.otaUrl); }
+
+String serializeJsonWithoutSig(JsonDocument &doc) {
+    if (doc.containsKey("signature")) doc.remove("signature");
+    String out;
+    serializeJson(doc, out);
+    return out;
+}
+
+bool sendWrappedJSON(const String &rawPayloadJson) {
+    if (!wifiConnected()) {
+        METRICS.consecutiveWifiFails++;
+        return false;
+    }
+    if (!allowOutboundRequest()) return false;
+    DynamicJsonDocument payloadDoc(4096);
+    DeserializationError err = deserializeJson(payloadDoc, rawPayloadJson);
+    if (err) {
+        Serial.printf("[POST] payload parse failed: %s\n", err.c_str());
+        return false;
+    }
+    String nonce = generateNonce();
+    uint32_t ts = (uint32_t)time(nullptr);
+    String did = String(CFG.deviceId);
+    payloadDoc["_nonce"] = nonce;
+    payloadDoc["_ts"] = ts;
+    payloadDoc["_did"] = did;
+    String canonicalPayload = canonicalStringify(payloadDoc.as<JsonVariantConst>());
+    String signature = computeHmacSha256(canonicalPayload, String(CFG.hmacSecret));
+    DynamicJsonDocument requestDoc(4096);
+    requestDoc["payload"] = payloadDoc;
+    requestDoc["signature"] = signature;
+    String body;
+    serializeJson(requestDoc, body);
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.setTimeout(15000);
+    if (!http.begin(client, CFG.webhookUrl)) return false;
+    http.addHeader("Content-Type", "application/json");
+    http.addHeader("x-device-id", did);
+    http.addHeader("x-fw-version", FW_VERSION);
+    http.addHeader("x-api-key", CFG.apiKey);
+    http.addHeader("x-timestamp", String(ts));
+    int code = http.POST(body);
+    String resp = (code > 0) ? http.getString() : "";
+    http.end();
+    if (code >= 200 && code < 300) {
+        DynamicJsonDocument respDoc(1024);
+        if (deserializeJson(respDoc, resp) == DeserializationError::Ok) {
+            if (respDoc.containsKey("signature")) {
+                String serverSig = respDoc["signature"].as<String>();
+                String respBody = serializeJsonWithoutSig(respDoc);
+                String expected = computeHmacSha256(respBody, String(CFG.hmacSecret));
+                if (serverSig != expected) {
+                    Serial.println("[POST] server signature mismatch");
+                    METRICS.postFailCount++;
+                    METRICS.consecutiveWifiFails++;
+                    return false;
+                }
+            }
+        }
+        METRICS.postSuccessCount++;
+        METRICS.consecutiveWifiFails = 0;
+        touchActivity();
+        return true;
+    }
+    METRICS.postFailCount++;
+    METRICS.consecutiveWifiFails++;
+    Serial.printf("[POST] failed code=%d\n", code);
+    return false;
+}
+
+bool fetchWithRetry(const String& url, String& payload, int maxRetries, uint32_t timeoutMs) {
+    for (int attempt = 0; attempt < maxRetries; attempt++) {
+        if (!wifiConnected()) {
+            delay(500);
+            continue;
+        }
+        WiFiClientSecure client;
+        client.setInsecure();
+        HTTPClient http;
+        http.setTimeout(timeoutMs);
+        if (!http.begin(client, url)) {
+            delay(250 * (attempt + 1));
+            continue;
+        }
+        int code = http.GET();
+        if (code >= 200 && code < 300) {
+            payload = http.getString();
+            http.end();
+            DynamicJsonDocument doc(4096);
+            if (deserializeJson(doc, payload) == DeserializationError::Ok) {
+                if (doc.containsKey("signature")) {
+                    String serverSig = doc["signature"].as<String>();
+                    String bodyWithoutSig = serializeJsonWithoutSig(doc);
+                    String expected = computeHmacSha256(bodyWithoutSig, String(CFG.hmacSecret));
+                    if (serverSig != expected) {
+                        Serial.println("[FETCH] server signature invalid");
+                        return false;
+                    }
+                }
+            }
+            METRICS.consecutiveWifiFails = 0;
+            return true;
+        }
+        http.end();
+        if (code == 429) delay(5000UL * (attempt + 1));
+        else delay(500 * (attempt + 1));
+    }
+    METRICS.consecutiveWifiFails++;
+    return false;
+}
+
+bool postJsonWithRetry(const String& url, const String& body, String& responseBody, int maxRetries) {
+    for (int attempt = 0; attempt < maxRetries; attempt++) {
+        if (!wifiConnected()) {
+            delay(500);
+            continue;
+        }
+        WiFiClientSecure client;
+        client.setInsecure();
+        HTTPClient http;
+        http.setTimeout(12000);
+        if (!http.begin(client, url)) {
+            delay(250 * (attempt + 1));
+            continue;
+        }
+        http.addHeader("Content-Type", "application/json");
+        int code = http.POST(body);
+        responseBody = (code > 0) ? http.getString() : "";
+        http.end();
+        if (code >= 200 && code < 300) {
+            METRICS.consecutiveWifiFails = 0;
+            return true;
+        }
+        Serial.printf("[HTTP] POST fail attempt %d code=%d resp=%s\n", attempt + 1, code, responseBody.c_str());
+        if (code == 429) delay(5000UL * (attempt + 1));
+        else delay(700 * (attempt + 1));
+    }
+    METRICS.consecutiveWifiFails++;
+    return false;
+}
+
+void ensureWifiConnection() {
+    if (wifiConnected()) {
+        METRICS.consecutiveWifiFails = 0;
+        return;
+    }
+    if (millis() - lastWiFiReconnectAttemptMs < WIFI_RECONNECT_MIN_MS) return;
+    lastWiFiReconnectAttemptMs = millis();
+    WiFi.reconnect();
+    METRICS.wifiReconnectCount++;
+    METRICS.consecutiveWifiFails++;
+    // Nếu fail quá nhiều, reboot để phục hồi
+    if (METRICS.consecutiveWifiFails >= MAX_CONSECUTIVE_FAILS) {
+        Serial.println("[WARN] Too many WiFi failures, rebooting...");
+        delay(100);
+        ESP.restart();
+    }
+}
+
+void syncTime() {
+    APP_STATE = AppState::TIME_SYNC;
+    configTime(TZ_OFFSET_SECONDS, 0, "pool.ntp.org", "time.google.com", "time.windows.com");
+    time_t now = time(nullptr);
+    int retries = 0;
+    while (now < 1600000000 && retries < 12) {
+        delay(1000);
+        now = time(nullptr);
+        retries++;
+        Serial.printf("[NTP] Sync attempt %d\n", retries);
+    }
+    if (now < 1600000000) {
+        Serial.println("[NTP] sync failed");
+        APP_STATE = AppState::DEGRADED_OFFLINE;
+    } else Serial.println("[NTP] synced: " + iso8601UTC(now));
+}
+
+// ============================ Hardware ============================
+void setupHardware() {
+    pinMode(RELAY_PIN1, OUTPUT); pinMode(RELAY_PIN2, OUTPUT);
+    pinMode(RELAY_PIN3, OUTPUT); pinMode(RELAY_PIN4, OUTPUT);
+    digitalWrite(RELAY_PIN1, RELAY_INACTIVE_LEVEL);
+    digitalWrite(RELAY_PIN2, RELAY_INACTIVE_LEVEL);
+    digitalWrite(RELAY_PIN3, RELAY_INACTIVE_LEVEL);
+    digitalWrite(RELAY_PIN4, RELAY_INACTIVE_LEVEL);
+    Wire.begin(PIN_SDA, PIN_SCL);
+    ds18b20.begin();
+    dht.begin();
+    adsReady = ads.begin(ADS1115_ADDR);
+    if (!adsReady) Serial.println("[HW] ADS1115 init failed");
+    analogReadResolution(12);
+    analogSetPinAttenuation(PIN_BATTERY_ADC, ADC_11db);
+    analogSetPinAttenuation(PIN_SOIL_ADC, ADC_11db);
+}
+
+bool initStorage() {
+    if (CFG.sdEnabled) {
+        SPI.begin(PIN_SD_SCK, PIN_SD_MISO, PIN_SD_MOSI, SD_CS_PIN);
+        if (SD.begin(SD_CS_PIN)) {
+            sdReady = true;
+            if (!SD.exists(BACKLOG_DIR)) SD.mkdir(BACKLOG_DIR);
+            if (!SD.exists(ARCHIVE_DIR)) SD.mkdir(ARCHIVE_DIR);
+            Serial.println("[STORAGE] SD initialized");
+            return true;
+        }
+        Serial.println("[STORAGE] SD init failed");
+        sdReady = false;
+    }
+    if (SPIFFS.begin(true)) {
+        if (!SPIFFS.exists(BACKLOG_DIR)) SPIFFS.mkdir(BACKLOG_DIR);
+        if (!SPIFFS.exists(ARCHIVE_DIR)) SPIFFS.mkdir(ARCHIVE_DIR);
+        Serial.println("[STORAGE] SPIFFS initialized");
+        return true;
+    }
+    Serial.println("[STORAGE] SPIFFS init failed");
+    return false;
+}
+
+// ============================ Cảm biến ============================
+float readBatteryVoltage() {
+    uint32_t sum = 0;
+    const int samples = 8;
+    for (int i = 0; i < samples; i++) {
+        sum += analogRead(PIN_BATTERY_ADC);
+        delay(2);
+    }
+    float raw = sum / (float)samples;
+    float vadc = (raw / 4095.0f) * 3.3f;
+    return vadc * BATTERY_DIVIDER_RATIO;
+}
+
+SensorReading makeReading(const String& type, float value, const String& unit, const String& sensorId, const String& zone) {
+    SensorReading r;
+    r.sensor_type = type;
+    r.value = value;
+    r.unit = unit;
+    r.sensor_id = sensorId;
+    r.zone = zone.length() ? zone : currentZone();
+    time_t now = time(nullptr);
+    r.event_ts = iso8601UTC(now);
+    r.local_time = iso8601Local(now);
+    return r;
+}
+
+SensorReading invalidReading(const String& type, const String& unit, const String& sensorId) {
+    return makeReading(type, INVALID_SENSOR_VALUE, unit, sensorId, currentZone());
+}
+
+SensorReading readDS18B20() {
+    ds18b20.requestTemperatures();
+    float temp = ds18b20.getTempCByIndex(0);
+    if (temp == DEVICE_DISCONNECTED_C || isnan(temp))
+        return invalidReading("temp", "C", "DS18B20_0");
+    return makeReading("temp", temp, "C", "DS18B20_0");
+}
+
+SensorReading readDHT22Temp() {
+    float temp = dht.readTemperature();
+    if (isnan(temp)) return invalidReading("temp", "C", "DHT22_0");
+    return makeReading("temp", temp, "C", "DHT22_0");
+}
+
+SensorReading readDHT22Humidity() {
+    float hum = dht.readHumidity();
+    if (isnan(hum)) return invalidReading("humidity", "%", "DHT22_0");
+    return makeReading("humidity", hum, "%", "DHT22_0");
+}
+
+SensorReading readSoilMoisture() {
+    int raw = analogRead(PIN_SOIL_ADC);
+    float percent = map(raw, 0, 4095, 0, 100);
+    if (percent < 0) percent = 0;
+    if (percent > 100) percent = 100;
+    return makeReading("soil_moisture", percent, "%", "SOIL_0");
+}
+
+SensorReading readADSpH() {
+    if (!adsReady) return invalidReading("pH", "", "ADS1115_0");
+    int16_t adc0 = ads.readADC_SingleEnded(0);
+    float voltage = (adc0 * 0.1875f) / 1000.0f;
+    float pH = 3.0f * voltage;
+    return makeReading("pH", pH, "", "ADS1115_0");
+}
+
+SensorReading readADSTDS() {
+    if (!adsReady) return invalidReading("tds", "ppm", "ADS1115_1");
+    int16_t adc1 = ads.readADC_SingleEnded(1);
+    float voltage = (adc1 * 0.1875f) / 1000.0f;
+    float tds = voltage * 1000.0f / 2.0f;
+    return makeReading("tds", tds, "ppm", "ADS1115_1");
+}
+
+SensorReading readADSDO() {
+    if (!adsReady) return invalidReading("do", "mg/L", "ADS1115_2");
+    int16_t adc2 = ads.readADC_SingleEnded(2);
+    float voltage = (adc2 * 0.1875f) / 1000.0f;
+    float do_mgL = voltage * 5.0f;
+    return makeReading("do", do_mgL, "mg/L", "ADS1115_2");
+}
+
+bool isValidReading(const SensorReading& s) {
+    return !isnan(s.value) && s.value > (INVALID_SENSOR_VALUE + 1.0f);
+}
+
+void processRuleForReading(const SensorReading& reading) {
+    for (auto &rule : controlRules) {
+        bool sensorMatch = (rule.sensor == reading.sensor_type) || (rule.sensor == reading.sensor_id);
+        bool zoneMatch = rule.zone.length() == 0 || rule.zone == reading.zone;
+        if (!sensorMatch || !zoneMatch) continue;
+        String key = rule.zone + "|" + rule.sensor;
+        RuleState& state = ruleStates[key];
+        unsigned long nowMs = millis();
+        bool outside = reading.value < rule.minVal || reading.value > rule.maxVal;
+        bool recoveredBand = (reading.value >= (rule.minVal + rule.hysteresis)) && (reading.value <= (rule.maxVal - rule.hysteresis));
+        if (outside) {
+            if (!state.active) {
+                if (state.triggeredAtMs == 0) state.triggeredAtMs = nowMs;
+                unsigned long elapsed = nowMs - state.triggeredAtMs;
+                if (rule.durationSec == 0 || elapsed >= (rule.durationSec * 1000UL)) {
+                    if (state.lastActionMs == 0 || (nowMs - state.lastActionMs) >= RULE_COOLDOWN_MS) {
+                        state.active = true;
+                        state.lastValue = reading.value;
+                        state.lastActionMs = nowMs;
