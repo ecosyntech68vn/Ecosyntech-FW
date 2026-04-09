@@ -1,0 +1,400 @@
+        METRICS.otaFailCount++;
+        return false;
+    }
+    if (!Update.begin(len > 0 ? len : UPDATE_SIZE_UNKNOWN)) {
+        http.end();
+        METRICS.otaFailCount++;
+        return false;
+    }
+    WiFiClient* stream = http.getStreamPtr();
+    uint8_t buf[1024];
+    size_t written = 0;
+    mbedtls_sha256_context ctx;
+    mbedtls_sha256_init(&ctx);
+    mbedtls_sha256_starts_ret(&ctx, 0);
+    unsigned long startedAt = millis();
+    while (http.connected() && (len > 0 ? written < (size_t)len : true)) {
+        if (millis() - startedAt > 120000UL) {
+            Serial.println("[OTA] timeout");
+            Update.abort();
+            mbedtls_sha256_free(&ctx);
+            http.end();
+            METRICS.otaFailCount++;
+            return false;
+        }
+        size_t avail = stream->available();
+        if (!avail) {
+            delay(10);
+            continue;
+        }
+        size_t toRead = min(sizeof(buf), avail);
+        int r = stream->readBytes(buf, toRead);
+        if (r <= 0) break;
+        mbedtls_sha256_update_ret(&ctx, buf, r);
+        if (Update.write(buf, r) != (size_t)r) {
+            Serial.println("[OTA] write failed");
+            Update.abort();
+            mbedtls_sha256_free(&ctx);
+            http.end();
+            METRICS.otaFailCount++;
+            return false;
+        }
+        written += r;
+    }
+    uint8_t hash[32];
+    mbedtls_sha256_finish_ret(&ctx, hash);
+    mbedtls_sha256_free(&ctx);
+    http.end();
+    if (len > 0 && written != (size_t)len) {
+        Serial.println("[OTA] incomplete download");
+        Update.abort();
+        METRICS.otaFailCount++;
+        return false;
+    }
+    String actualSha = bytesToHex(hash, 32);
+    if (expectedSha256.length() == 64 && actualSha != expectedSha256) {
+        Serial.println("[OTA] sha256 mismatch");
+        Update.abort();
+        METRICS.otaFailCount++;
+        return false;
+    }
+    if (!Update.end(true)) {
+        Serial.println("[OTA] update end failed");
+        METRICS.otaFailCount++;
+        return false;
+    }
+    otaPending = true;
+    METRICS.otaSuccessCount++;
+    Serial.println("[OTA] downloaded, pending reboot");
+    touchActivity();
+    return true;
+}
+
+// ============================ Remote config ============================
+bool fetchRemoteConfig() {
+    if (!wifiConnected()) return false;
+    String url = getConfigUrl() + "?action=get_config&device_id=" + String(CFG.deviceId) + "&api_key=" + String(CFG.apiKey);
+    String payload;
+    if (!fetchWithRetry(url, payload, 3)) return false;
+    DynamicJsonDocument doc(4096);
+    if (deserializeJson(doc, payload) != DeserializationError::Ok) {
+        Serial.println("[CONFIG] JSON parse failed");
+        return false;
+    }
+    if (!doc.containsKey("payload") || !doc.containsKey("signature")) return false;
+    JsonObject payloadObj = doc["payload"].as<JsonObject>();
+    String signature = doc["signature"].as<String>();
+    String canonicalPayload = canonicalStringify(payloadObj.as<JsonVariantConst>());
+    String expectedSig = computeHmacSha256(canonicalPayload, String(CFG.hmacSecret));
+    if (signature != expectedSig) {
+        Serial.println("[CONFIG] HMAC invalid");
+        return false;
+    }
+    String nonce = payloadObj["_nonce"] | "";
+    uint32_t ts = payloadObj["_ts"] | 0;
+    String did = payloadObj["_did"] | "";
+    if (did != CFG.deviceId) {
+        Serial.println("[CONFIG] wrong device id");
+        return false;
+    }
+    if (!isNonceValid(did, nonce, ts)) {
+        Serial.println("[CONFIG] nonce invalid or replay");
+        return false;
+    }
+    bool changed = false;
+    uint32_t remoteVer = 0;
+    if (payloadObj.containsKey("config") && payloadObj["config"].is<JsonObject>()) {
+        JsonObject config = payloadObj["config"].as<JsonObject>();
+        remoteVer = config["config_version"] | payloadObj["config_version"] | (DYN_CFG.config_version + 1);
+        if (remoteVer > DYN_CFG.config_version) {
+            DYN_CFG.post_interval_sec = config["post_interval_sec"] | DYN_CFG.post_interval_sec;
+            DYN_CFG.sensor_interval_sec = config["sensor_interval_sec"] | DYN_CFG.sensor_interval_sec;
+            DYN_CFG.deep_sleep_enabled = config["deep_sleep_enabled"] | DYN_CFG.deep_sleep_enabled;
+            DYN_CFG.ml_anomaly_enabled = config["ml_anomaly_enabled"] | DYN_CFG.ml_anomaly_enabled;
+            DYN_CFG.max_data_age_days = config["max_data_age_days"] | DYN_CFG.max_data_age_days;
+            DYN_CFG.batch_sync_interval_sec = config["batch_sync_interval_sec"] | DYN_CFG.batch_sync_interval_sec;
+            DYN_CFG.ota_check_interval_sec = config["ota_check_interval_sec"] | DYN_CFG.ota_check_interval_sec;
+            DYN_CFG.cleanup_interval_sec = config["cleanup_interval_sec"] | DYN_CFG.cleanup_interval_sec;
+            DYN_CFG.config_version = remoteVer;
+            CFG.pushIntervalSec = DYN_CFG.post_interval_sec;
+            saveConfig();
+            changed = true;
+            Serial.println("[CONFIG] Updated v" + String(DYN_CFG.config_version));
+        }
+        rememberNonce(nonce, ts);
+        touchActivity();
+        return true;
+    }
+    remoteVer = payloadObj["config_version"] | (DYN_CFG.config_version + 1);
+    if (remoteVer > DYN_CFG.config_version) {
+        if (payloadObj.containsKey("post_interval_sec")) {
+            DYN_CFG.post_interval_sec = payloadObj["post_interval_sec"] | DYN_CFG.post_interval_sec;
+            CFG.pushIntervalSec = DYN_CFG.post_interval_sec;
+            changed = true;
+        }
+        if (payloadObj.containsKey("sensor_interval_sec")) { DYN_CFG.sensor_interval_sec = payloadObj["sensor_interval_sec"] | DYN_CFG.sensor_interval_sec; changed = true; }
+        if (payloadObj.containsKey("deep_sleep_enabled")) { DYN_CFG.deep_sleep_enabled = payloadObj["deep_sleep_enabled"] | DYN_CFG.deep_sleep_enabled; changed = true; }
+        if (payloadObj.containsKey("ml_anomaly_enabled")) { DYN_CFG.ml_anomaly_enabled = payloadObj["ml_anomaly_enabled"] | DYN_CFG.ml_anomaly_enabled; changed = true; }
+        if (payloadObj.containsKey("max_data_age_days")) { DYN_CFG.max_data_age_days = payloadObj["max_data_age_days"] | DYN_CFG.max_data_age_days; changed = true; }
+        if (payloadObj.containsKey("batch_sync_interval_sec")) { DYN_CFG.batch_sync_interval_sec = payloadObj["batch_sync_interval_sec"] | DYN_CFG.batch_sync_interval_sec; changed = true; }
+        if (payloadObj.containsKey("ota_check_interval_sec")) { DYN_CFG.ota_check_interval_sec = payloadObj["ota_check_interval_sec"] | DYN_CFG.ota_check_interval_sec; changed = true; }
+        if (payloadObj.containsKey("cleanup_interval_sec")) { DYN_CFG.cleanup_interval_sec = payloadObj["cleanup_interval_sec"] | DYN_CFG.cleanup_interval_sec; changed = true; }
+        DYN_CFG.config_version = remoteVer;
+        if (changed) saveConfig();
+        Serial.println("[CONFIG] Updated legacy top-level config");
+    }
+    rememberNonce(nonce, ts);
+    touchActivity();
+    return true;
+}
+
+// ============================ Backlog ============================
+bool processOneBacklogPayload(const String& body) { return sendWrappedJSON(body); }
+
+void retryBacklog() {
+    if (!wifiConnected()) return;
+    uint32_t count = 0;
+    const uint32_t maxPerRun = 10;
+    File dir = (sdReady && CFG.sdEnabled) ? SD.open(BACKLOG_DIR) : SPIFFS.open(BACKLOG_DIR);
+    if (!dir) return;
+    while (count < maxPerRun) {
+        File entry = dir.openNextFile();
+        if (!entry) break;
+        if (!entry.isDirectory()) {
+            String path = joinPath(BACKLOG_DIR, String(entry.name()));
+            File file = (sdReady && CFG.sdEnabled) ? SD.open(path, FILE_READ) : SPIFFS.open(path, FILE_READ);
+            if (file) {
+                String body = file.readString();
+                file.close();
+                if (processOneBacklogPayload(body)) {
+                    openStorageRemove(path);
+                    METRICS.backlogSendCount++;
+                    Serial.println("[BACKLOG] sent and deleted: " + path);
+                } else {
+                    METRICS.backlogFailCount++;
+                    Serial.println("[BACKLOG] failed: " + path);
+                }
+            }
+            count++;
+        }
+        entry.close();
+    }
+    dir.close();
+    touchActivity();
+    Serial.printf("[BACKLOG] retry processed %u files\n", (unsigned)count);
+}
+
+void cleanupOldData() {
+    File dir = (sdReady && CFG.sdEnabled) ? SD.open(BACKLOG_DIR) : SPIFFS.open(BACKLOG_DIR);
+    if (!dir) return;
+    std::vector<String> paths;
+    uint32_t nowEpoch = (uint32_t)time(nullptr);
+    bool timeValid = isTimeValid();
+    while (true) {
+        File entry = dir.openNextFile();
+        if (!entry) break;
+        if (!entry.isDirectory()) {
+            String path = joinPath(BACKLOG_DIR, String(entry.name()));
+            if (entry.size() > 250 * 1024) openStorageRemove(path);
+            else {
+                if (timeValid) {
+                    uint32_t fileTs = 0;
+                    if (parseBacklogTimestamp(path, fileTs)) {
+                        uint32_t ageDays = (nowEpoch > fileTs) ? ((nowEpoch - fileTs) / 86400UL) : 0;
+                        if (ageDays > DYN_CFG.max_data_age_days) {
+                            openStorageRemove(path);
+                            entry.close();
+                            continue;
+                        }
+                    }
+                }
+                paths.push_back(path);
+            }
+        }
+        entry.close();
+    }
+    dir.close();
+    if (paths.size() > MAX_BACKLOG_FILES_SPIFFS) {
+        std::sort(paths.begin(), paths.end());
+        size_t extra = paths.size() - MAX_BACKLOG_FILES_SPIFFS;
+        for (size_t i = 0; i < extra; i++) openStorageRemove(paths[i]);
+    }
+    touchActivity();
+}
+
+void reportCommandResult(const String& commandId, const String& commandName, const String& status, const String& note) {
+    DynamicJsonDocument payload(1024);
+    payload["event_type"] = "command_result";
+    payload["command_id"] = commandId;
+    payload["command"] = commandName;
+    payload["status"] = status;
+    payload["note"] = note;
+    payload["device_id"] = String(CFG.deviceId);
+    payload["fw_version"] = FW_VERSION;
+    payload["ts"] = getCurrentUTCTimestamp();
+    String payloadJson;
+    serializeJson(payload, payloadJson);
+    if (wifiConnected()) {
+        String resp;
+        postJsonWithRetry(String(CFG.webhookUrl), payloadJson, resp, 2);
+    }
+    if (DYN_CFG.mqtt_enabled && mqttConnected) {
+        String topic = String("ecosyntech/") + CFG.deviceId + "/result";
+        mqttClient.publish(topic.c_str(), payloadJson.c_str());
+    }
+}
+
+void captureMediaStub() {
+    String batchId = activeBatches.size() ? activeBatches[0].batch_id : "default_batch";
+    String metaDesc = "Camera capture from " + String(CFG.deviceName);
+    DynamicJsonDocument mediaDoc(4096);
+    mediaDoc["action"] = "upload_media";
+    mediaDoc["batchId"] = batchId;
+    mediaDoc["metaDesc"] = metaDesc;
+    mediaDoc["device_id"] = String(CFG.deviceId);
+    mediaDoc["fw_version"] = FW_VERSION;
+    JsonArray files = mediaDoc.createNestedArray("files");
+    for (int i = 0; i < 5; i++) {
+        JsonObject file = files.createNestedObject();
+        file["name"] = "image_" + String(i) + ".jpg";
+        file["mimeType"] = "image/jpeg";
+        file["data"] = "base64_dummy_data";
+    }
+    String mediaPayload;
+    serializeJson(mediaDoc, mediaPayload);
+    logEvent(String(CFG.deviceId), "media_stub", mediaPayload, "local");
+    sendWrappedJSON(mediaPayload);
+}
+
+bool postToBlockchain(const String& snapshotPayload, const String& deviceId) {
+    DynamicJsonDocument doc(1024);
+    doc["ts"] = getCurrentUTCTimestamp();
+    doc["device_id"] = deviceId;
+    doc["payload"] = snapshotPayload;
+    doc["rpc"] = "https://dummy-blockchain-rpc";  // Thay bằng RPC thực tế
+    String out;
+    serializeJson(doc, out);
+    String path = String(ARCHIVE_DIR) + "/" + genPayloadId() + ".blockchain.json";
+    bool ok = openStorageWrite(path, out);
+    if (ok) logEvent(deviceId, "blockchain_stub", out, "local");
+    return ok;
+}
+
+// ============================ Health & Debug ============================
+String buildHealthJson() {
+    DynamicJsonDocument doc(1024);
+    doc["device_id"] = String(CFG.deviceId);
+    doc["fw_version"] = FW_VERSION;
+    doc["uptime_sec"] = (uint32_t)(millis() / 1000);
+    doc["rssi"] = wifiConnected() ? WiFi.RSSI() : -127;
+    doc["battery_v"] = readBatteryVoltage();
+    doc["backlog_count"] = getBacklogCount();
+    doc["free_heap"] = ESP.getFreeHeap();
+    doc["min_free_heap"] = ESP.getMinFreeHeap();
+    doc["config_version"] = DYN_CFG.config_version;
+    doc["wifi_connected"] = wifiConnected();
+    doc["ota_pending"] = otaPending;
+    doc["sensor_reads"] = METRICS.sensorReadCount;
+    doc["heartbeat_count"] = METRICS.heartbeatCount;
+    doc["post_success"] = METRICS.postSuccessCount;
+    doc["post_fail"] = METRICS.postFailCount;
+    doc["command_exec"] = METRICS.commandExecCount;
+    doc["backlog_send"] = METRICS.backlogSendCount;
+    doc["backlog_fail"] = METRICS.backlogFailCount;
+    doc["event_log_writes"] = eventLogWriteCount;
+    doc["push_interval_sec"] = DYN_CFG.post_interval_sec;
+    doc["sensor_interval_sec"] = DYN_CFG.sensor_interval_sec;
+    doc["deep_sleep_enabled"] = DYN_CFG.deep_sleep_enabled;
+    doc["rate_limit_per_device"] = RATE_LIMIT_PER_DEVICE;
+    doc["replay_window_sec"] = REPLAY_WINDOW_SEC;
+    doc["mqtt_enabled"] = DYN_CFG.mqtt_enabled;
+    doc["mqtt_connected"] = mqttConnected;
+    String out;
+    serializeJson(doc, out);
+    return out;
+}
+
+void handleDebugServer() {
+    WiFiClient client = debugServer.available();
+    if (!client) return;
+    client.setTimeout(2000);
+    String req = client.readStringUntil('\r');
+    client.readStringUntil('\n');
+    int sp1 = req.indexOf(' ');
+    int sp2 = req.indexOf(' ', sp1 + 1);
+    String path = "/";
+    if (sp1 >= 0 && sp2 > sp1) path = req.substring(sp1 + 1, sp2);
+    client.println("HTTP/1.1 200 OK");
+    client.println("Content-Type: application/json; charset=utf-8");
+    client.println("Connection: close");
+    client.println();
+    if (path.indexOf("/health") >= 0) client.println(buildHealthJson());
+    else {
+        DynamicJsonDocument doc(512);
+        doc["device"] = String(CFG.deviceName);
+        doc["fw_version"] = FW_VERSION;
+        doc["uptime_sec"] = (uint32_t)(millis() / 1000);
+        doc["rssi"] = wifiConnected() ? WiFi.RSSI() : -127;
+        doc["battery_v"] = readBatteryVoltage();
+        doc["backlog_count"] = getBacklogCount();
+        String out;
+        serializeJson(doc, out);
+        client.println(out);
+    }
+    client.stop();
+}
+
+// ============================ State machine & Sleep ============================
+void updateAppState() {
+    if (otaPending) APP_STATE = AppState::OTA_PENDING;
+    else if (maintenanceMode) APP_STATE = AppState::MAINTENANCE;
+    else if (!wifiConnected() && wifiEverConnected) APP_STATE = AppState::DEGRADED_OFFLINE;
+    else APP_STATE = AppState::RUNNING;
+}
+
+void enterDeepSleepIfNeeded() {
+    if (!DYN_CFG.deep_sleep_enabled || maintenanceMode) return;
+    if (CFG.deepSleepSec < MIN_INTERVAL_SEC) return;
+    // Kiểm tra xem có lệnh chờ hay không (nếu có command chưa xử lý thì không sleep)
+    bool hasPendingCommands = false; // Có thể mở rộng kiểm tra qua MQTT hoặc backlog
+    if (hasPendingCommands) return;
+    unsigned long idleMs = millis() - lastActivityMs;
+    unsigned long targetMs = CFG.deepSleepSec * 1000UL;
+    if (idleMs >= targetMs) {
+        Serial.println("[SLEEP] entering deep sleep");
+        delay(100);
+        // Lưu trạng thái cần thiết vào RTC memory (tùy chọn)
+        esp_sleep_enable_timer_wakeup((uint64_t)CFG.deepSleepSec * 1000000ULL);
+        esp_deep_sleep_start();
+    }
+}
+
+// ============================ WiFiManager ============================
+void setupWiFiManager() {
+    WiFi.mode(WIFI_STA);
+    WiFi.setAutoReconnect(true);
+    WiFiManager wm;
+    char deviceIdBuf[48], deviceNameBuf[48], webhookUrlBuf[256], batchUrlBuf[256], hmacSecretBuf[128];
+    char otaUrlBuf[256], apiKeyBuf[80], sdEnabledBuf[4], deepSleepEnabledBuf[4], deepSleepSecBuf[12], pushIntervalBuf[12];
+    copyStringSafe(deviceIdBuf, sizeof(deviceIdBuf), String(CFG.deviceId));
+    copyStringSafe(deviceNameBuf, sizeof(deviceNameBuf), String(CFG.deviceName));
+    copyStringSafe(webhookUrlBuf, sizeof(webhookUrlBuf), String(CFG.webhookUrl));
+    copyStringSafe(batchUrlBuf, sizeof(batchUrlBuf), String(CFG.getBatchUrl));
+    copyStringSafe(hmacSecretBuf, sizeof(hmacSecretBuf), String(CFG.hmacSecret));
+    copyStringSafe(otaUrlBuf, sizeof(otaUrlBuf), String(CFG.otaUrl));
+    copyStringSafe(apiKeyBuf, sizeof(apiKeyBuf), String(CFG.apiKey));
+    copyStringSafe(sdEnabledBuf, sizeof(sdEnabledBuf), CFG.sdEnabled ? "1" : "0");
+    copyStringSafe(deepSleepEnabledBuf, sizeof(deepSleepEnabledBuf), DYN_CFG.deep_sleep_enabled ? "1" : "0");
+    copyStringSafe(deepSleepSecBuf, sizeof(deepSleepSecBuf), String(CFG.deepSleepSec));
+    copyStringSafe(pushIntervalBuf, sizeof(pushIntervalBuf), String(DYN_CFG.post_interval_sec));
+    WiFiManagerParameter p_deviceId("deviceid", "Device ID", deviceIdBuf, sizeof(deviceIdBuf));
+    WiFiManagerParameter p_deviceName("devicename", "Device Name", deviceNameBuf, sizeof(deviceNameBuf));
+    WiFiManagerParameter p_webhookUrl("webhook", "Webhook URL", webhookUrlBuf, sizeof(webhookUrlBuf));
+    WiFiManagerParameter p_getBatchUrl("batchurl", "Config/Command URL", batchUrlBuf, sizeof(batchUrlBuf));
+    WiFiManagerParameter p_hmacSecret("hmac", "HMAC Secret", hmacSecretBuf, sizeof(hmacSecretBuf));
+    WiFiManagerParameter p_otaUrl("ota", "OTA URL", otaUrlBuf, sizeof(otaUrlBuf));
+    WiFiManagerParameter p_apiKey("apikey", "API Key", apiKeyBuf, sizeof(apiKeyBuf));
+    WiFiManagerParameter p_sdEnabled("sdenabled", "SD Enabled (0/1)", sdEnabledBuf, sizeof(sdEnabledBuf));
+    WiFiManagerParameter p_deepSleepEnabled("deepsleep", "Deep Sleep Enabled (0/1)", deepSleepEnabledBuf, sizeof(deepSleepEnabledBuf));
+    WiFiManagerParameter p_deepSleepSec("deepsleepsec", "Deep Sleep Seconds", deepSleepSecBuf, sizeof(deepSleepSecBuf));
+    WiFiManagerParameter p_pushIntervalSec("pushinterval", "Push Interval Seconds", pushIntervalBuf, sizeof(pushIntervalBuf));

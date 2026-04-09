@@ -1,0 +1,170 @@
+    wm.addParameter(&p_deviceId); wm.addParameter(&p_deviceName); wm.addParameter(&p_webhookUrl);
+    wm.addParameter(&p_getBatchUrl); wm.addParameter(&p_hmacSecret); wm.addParameter(&p_otaUrl);
+    wm.addParameter(&p_apiKey); wm.addParameter(&p_sdEnabled); wm.addParameter(&p_deepSleepEnabled);
+    wm.addParameter(&p_deepSleepSec); wm.addParameter(&p_pushIntervalSec);
+    wm.setConfigPortalTimeout(180);
+    if (!wm.autoConnect("EcoSynTech-Setup", "password")) {
+        Serial.println("[WiFi] Failed to connect, restarting");
+        delay(3000);
+        ESP.restart();
+    }
+    copyStringSafe(CFG.deviceId, sizeof(CFG.deviceId), String(p_deviceId.getValue()));
+    copyStringSafe(CFG.deviceName, sizeof(CFG.deviceName), String(p_deviceName.getValue()));
+    copyStringSafe(CFG.webhookUrl, sizeof(CFG.webhookUrl), String(p_webhookUrl.getValue()));
+    copyStringSafe(CFG.getBatchUrl, sizeof(CFG.getBatchUrl), String(p_getBatchUrl.getValue()));
+    copyStringSafe(CFG.hmacSecret, sizeof(CFG.hmacSecret), String(p_hmacSecret.getValue()));
+    copyStringSafe(CFG.otaUrl, sizeof(CFG.otaUrl), String(p_otaUrl.getValue()));
+    copyStringSafe(CFG.apiKey, sizeof(CFG.apiKey), String(p_apiKey.getValue()));
+    CFG.sdEnabled = String(p_sdEnabled.getValue()).toInt() != 0;
+    DYN_CFG.deep_sleep_enabled = String(p_deepSleepEnabled.getValue()).toInt() != 0;
+    CFG.deepSleepEnabled = DYN_CFG.deep_sleep_enabled;
+    CFG.deepSleepSec = max((unsigned long)MIN_INTERVAL_SEC, (unsigned long)strtoul(p_deepSleepSec.getValue(), nullptr, 10));
+    CFG.pushIntervalSec = max((unsigned long)MIN_INTERVAL_SEC, (unsigned long)strtoul(p_pushIntervalSec.getValue(), nullptr, 10));
+    DYN_CFG.post_interval_sec = CFG.pushIntervalSec;
+    saveConfig();
+    wifiEverConnected = true;
+    touchActivity();
+    Serial.println("[WiFi] Connected IP: " + WiFi.localIP().toString());
+}
+
+// ============================ Setup & Loop ============================
+void setup() {
+    Serial.begin(115200);
+    delay(1000);
+    Serial.println();
+    Serial.println("EcoSynTech Firmware v" + String(FW_VERSION));
+    // Khởi tạo watchdog với timeout 30 giây
+    esp_task_wdt_init(WATCHDOG_TIMEOUT_SEC, true);
+    esp_task_wdt_add(NULL);
+    bootMs = millis();
+    lastActivityMs = millis();
+    APP_STATE = AppState::BOOT;
+    setupHardware();
+    loadStoredConfig();
+    loadHandledCommands();
+    initStorage();
+    APP_STATE = AppState::WIFI_SETUP;
+    setupWiFiManager();
+    syncTime();
+    APP_STATE = AppState::LOAD_CONFIG;
+    loadRules();
+    debugServer.begin();
+    // MQTT
+    mqttClient.setClient(DYN_CFG.mqtt_tls ? mqttSecureClient : mqttPlainClient);
+    mqttClient.setServer(DYN_CFG.mqtt_broker, DYN_CFG.mqtt_port);
+    mqttClient.setCallback(mqttCallback);
+    mqttReconnect();
+    lastSensorMs = millis();
+    lastHeartbeatMs = millis();
+    lastBatchSyncMs = millis();
+    lastBacklogRetryMs = millis();
+    lastOTAcheckMs = millis();
+    lastCleanupMs = millis();
+    lastConfigFetchMs = millis();
+    lastCommandCheckMs = millis();
+    lastNonceCleanupMs = millis();
+    normalizeConfig();
+    updateAppState();
+}
+
+void loop() {
+    // Reset watchdog mỗi vòng lặp
+    esp_task_wdt_reset();
+    unsigned long nowMs = millis();
+    updateAppState();
+    if (otaPending) {
+        Serial.println("[OTA] rebooting to apply update...");
+        delay(1000);
+        ESP.restart();
+    }
+    ensureWifiConnection();
+    processMqtt();
+    if (nowMs - lastSensorMs >= (DYN_CFG.sensor_interval_sec * 1000UL)) {
+        processSensorLoop();
+        lastSensorMs = nowMs;
+    }
+    if (nowMs - lastHeartbeatMs >= (DYN_CFG.post_interval_sec * 1000UL)) {
+        processHeartbeatLoop();
+        lastHeartbeatMs = nowMs;
+    }
+    if (nowMs - lastBatchSyncMs >= (DYN_CFG.batch_sync_interval_sec * 1000UL)) {
+        loadRules();
+        lastBatchSyncMs = nowMs;
+    }
+    if (nowMs - lastBacklogRetryMs >= BACKLOG_RETRY_INTERVAL_MS) {
+        retryBacklog();
+        lastBacklogRetryMs = nowMs;
+    }
+    if (nowMs - lastOTAcheckMs >= (DYN_CFG.ota_check_interval_sec * 1000UL)) {
+        checkOTA();
+        lastOTAcheckMs = nowMs;
+    }
+    if (nowMs - lastCleanupMs >= (DYN_CFG.cleanup_interval_sec * 1000UL)) {
+        cleanupOldData();
+        cleanupArchiveData();
+        lastCleanupMs = nowMs;
+    }
+    if (nowMs - lastConfigFetchMs >= 3600UL * 1000UL) {
+        fetchRemoteConfig();
+        lastConfigFetchMs = nowMs;
+    }
+    if (nowMs - lastCommandCheckMs >= COMMAND_CHECK_INTERVAL_MS) {
+        fetchCommands();
+        lastCommandCheckMs = nowMs;
+    }
+    if (nowMs - lastNonceCleanupMs >= 3600000UL) {
+        cleanupNonces();
+        lastNonceCleanupMs = nowMs;
+    }
+    
+    // Auto-recovery khi hệ thống gặp sự cố nghiêm trọng
+    uint8_t healthScore = computeDeviceHealthScore();
+    if (healthScore < 30 || 
+        METRICS.consecutiveWifiFails >= MAX_CONSECUTIVE_FAILS ||
+        METRICS.consecutiveMqttFails >= MAX_CONSECUTIVE_FAILS ||
+        ESP.getFreeHeap() < 30000) {
+        
+        logEvent(CFG.deviceId, "auto_recover", 
+            String("{\"wifi_fails\":") + String(METRICS.consecutiveWifiFails) + 
+            String(",\"mqtt_fails\":") + String(METRICS.consecutiveMqttFails) +
+            String(",\"free_heap\":") + String(ESP.getFreeHeap()) +
+            String(",\"health_score\":") + String(healthScore) + String("}"), 
+            "firmware");
+        
+        Serial.printf("[RECOVERY] Health score: %d, triggering safe restart...\n", healthScore);
+        delay(1000);
+        ESP.restart();
+    }
+    
+    enterDeepSleepIfNeeded();
+    handleDebugServer();
+    METRICS.lastKnownFreeHeap = ESP.getFreeHeap();
+    delay(50);
+}
+
+// Tính toán device health score (0-100)
+uint8_t computeDeviceHealthScore() {
+    uint8_t score = 100;
+    
+    // Trừ điểm cho WiFi fail
+    score -= std::min(METRICS.consecutiveWifiFails * 5, (uint32_t)30);
+    
+    // Trừ điểm cho MQTT fail  
+    score -= std::min(METRICS.consecutiveMqttFails * 5, (uint32_t)20);
+    
+    // Trừ điểm khi heap thấp
+    uint32_t heap = ESP.getFreeHeap();
+    if (heap < 20000) score -= 20;
+    else if (heap < 30000) score -= 10;
+    else if (heap < 40000) score -= 5;
+    
+    // Trừ điểm khi backlog đầy
+    uint32_t backlogCount = getBacklogCount();
+    if (backlogCount > 100) score -= 15;
+    else if (backlogCount > 50) score -= 10;
+    
+    // Trừ điểm khi post fail cao
+    if (METRICS.postFailCount > 100) score -= 10;
+    
+    return score > 0 ? score : 0;
+}

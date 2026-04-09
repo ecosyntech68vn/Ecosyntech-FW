@@ -1,0 +1,400 @@
+
+String joinPath(const String& dir, const String& name) {
+    if (name.startsWith("/")) return name;
+    if (dir.endsWith("/")) return dir + name;
+    return dir + "/" + name;
+}
+
+String currentBatchId() {
+    if (activeBatches.empty()) return "default_batch";
+    for (const auto& b : activeBatches)
+        if (b.force_send || String(b.status).equalsIgnoreCase("active"))
+            return b.batch_id;
+    return activeBatches[0].batch_id.length() ? activeBatches[0].batch_id : "default_batch";
+}
+
+String currentZone() {
+    if (activeBatches.empty()) return "default";
+    for (const auto& b : activeBatches)
+        if (b.force_send || String(b.status).equalsIgnoreCase("active"))
+            return b.zone.length() ? b.zone : "default";
+    return activeBatches[0].zone.length() ? activeBatches[0].zone : "default";
+}
+
+// ============================ Cấu hình & lưu trữ ============================
+void normalizeConfig() {
+    if (CFG.deepSleepSec < MIN_INTERVAL_SEC) CFG.deepSleepSec = MIN_INTERVAL_SEC;
+    if (CFG.pushIntervalSec < MIN_INTERVAL_SEC) CFG.pushIntervalSec = MIN_INTERVAL_SEC;
+    if (DYN_CFG.post_interval_sec < MIN_INTERVAL_SEC) DYN_CFG.post_interval_sec = CFG.pushIntervalSec;
+    if (DYN_CFG.sensor_interval_sec < MIN_INTERVAL_SEC) DYN_CFG.sensor_interval_sec = 60;
+    if (DYN_CFG.batch_sync_interval_sec < MIN_INTERVAL_SEC) DYN_CFG.batch_sync_interval_sec = 21600;
+    if (DYN_CFG.ota_check_interval_sec < MIN_INTERVAL_SEC) DYN_CFG.ota_check_interval_sec = 43200;
+    if (DYN_CFG.cleanup_interval_sec < MIN_INTERVAL_SEC) DYN_CFG.cleanup_interval_sec = 86400;
+    if (DYN_CFG.max_data_age_days == 0) DYN_CFG.max_data_age_days = 180;
+}
+
+void saveConfig() {
+    normalizeConfig();
+    prefs.begin("ecofarm", false);
+    prefs.putBytes("config", &CFG, sizeof(CFG));
+    prefs.putUInt("post_int", DYN_CFG.post_interval_sec);
+    prefs.putUInt("sens_int", DYN_CFG.sensor_interval_sec);
+    prefs.putBool("deep_sl", DYN_CFG.deep_sleep_enabled);
+    prefs.putBool("ml_anom", DYN_CFG.ml_anomaly_enabled);
+    prefs.putUInt("max_age", DYN_CFG.max_data_age_days);
+    prefs.putUInt("batch_sync", DYN_CFG.batch_sync_interval_sec);
+    prefs.putUInt("ota_check", DYN_CFG.ota_check_interval_sec);
+    prefs.putUInt("cleanup_int", DYN_CFG.cleanup_interval_sec);
+    prefs.putUInt("cfg_ver", DYN_CFG.config_version);
+    prefs.putBool("mqtt_en", DYN_CFG.mqtt_enabled);
+    prefs.putString("mqtt_broker", String(DYN_CFG.mqtt_broker));
+    prefs.putUShort("mqtt_port", DYN_CFG.mqtt_port);
+    prefs.putString("mqtt_user", String(DYN_CFG.mqtt_user));
+    prefs.putString("mqtt_pass", String(DYN_CFG.mqtt_pass));
+    prefs.putBool("mqtt_tls", DYN_CFG.mqtt_tls);
+    prefs.end();
+}
+
+void loadStoredConfig() {
+    prefs.begin("ecofarm", true);
+    size_t sz = prefs.getBytes("config", &CFG, sizeof(CFG));
+    if (sz != sizeof(CFG)) Serial.println("[CFG] Using defaults for static config");
+    else Serial.println("[CFG] Loaded static config from NVS");
+    DYN_CFG.post_interval_sec = prefs.getUInt("post_int", CFG.pushIntervalSec);
+    DYN_CFG.sensor_interval_sec = prefs.getUInt("sens_int", 60);
+    DYN_CFG.deep_sleep_enabled = prefs.getBool("deep_sl", CFG.deepSleepEnabled);
+    DYN_CFG.ml_anomaly_enabled = prefs.getBool("ml_anom", false);
+    DYN_CFG.max_data_age_days = prefs.getUInt("max_age", 180);
+    DYN_CFG.batch_sync_interval_sec = prefs.getUInt("batch_sync", 21600);
+    DYN_CFG.ota_check_interval_sec = prefs.getUInt("ota_check", 43200);
+    DYN_CFG.cleanup_interval_sec = prefs.getUInt("cleanup_int", 86400);
+    DYN_CFG.config_version = prefs.getUInt("cfg_ver", 0);
+    DYN_CFG.mqtt_enabled = prefs.getBool("mqtt_en", true);
+    String broker = prefs.getString("mqtt_broker", DEFAULT_MQTT_BROKER);
+    strncpy(DYN_CFG.mqtt_broker, broker.c_str(), sizeof(DYN_CFG.mqtt_broker)-1);
+    DYN_CFG.mqtt_port = prefs.getUShort("mqtt_port", DEFAULT_MQTT_PORT);
+    String user = prefs.getString("mqtt_user", DEFAULT_MQTT_USER);
+    strncpy(DYN_CFG.mqtt_user, user.c_str(), sizeof(DYN_CFG.mqtt_user)-1);
+    String pass = prefs.getString("mqtt_pass", DEFAULT_MQTT_PASS);
+    strncpy(DYN_CFG.mqtt_pass, pass.c_str(), sizeof(DYN_CFG.mqtt_pass)-1);
+    DYN_CFG.mqtt_tls = prefs.getBool("mqtt_tls", true);
+    prefs.end();
+    normalizeConfig();
+}
+
+void saveHandledCommands() {
+    String joined;
+    for (size_t i = 0; i < handledCommands.size(); i++) {
+        if (i) joined += ",";
+        joined += handledCommands[i];
+    }
+    prefs.begin("ecofarm_cmd", false);
+    prefs.putString("handled_ids", joined);
+    prefs.end();
+}
+
+void loadHandledCommands() {
+    handledCommands.clear();
+    prefs.begin("ecofarm_cmd", true);
+    String raw = prefs.getString("handled_ids", "");
+    prefs.end();
+    if (raw.length() == 0) return;
+    int start = 0;
+    while (start < raw.length()) {
+        int sep = raw.indexOf(',', start);
+        if (sep < 0) sep = raw.length();
+        String id = raw.substring(start, sep);
+        id.trim();
+        if (id.length()) handledCommands.push_back(id);
+        start = sep + 1;
+    }
+}
+
+bool wasCommandHandled(const String& commandId) {
+    if (commandId.length() == 0) return true;
+    for (const auto& id : handledCommands) if (id == commandId) return true;
+    return false;
+}
+
+void rememberCommandId(const String& commandId) {
+    if (commandId.length() == 0) return;
+    if (wasCommandHandled(commandId)) return;
+    handledCommands.push_back(commandId);
+    if (handledCommands.size() > MAX_HANDLED_COMMANDS)
+        handledCommands.erase(handledCommands.begin());
+    saveHandledCommands();
+}
+
+// ============================ Nonce ============================
+bool isNonceValid(const String& deviceId, const String& nonce, uint32_t ts) {
+    if (nonce.length() == 0 || ts == 0) return false;
+    uint32_t nowTs = (uint32_t)time(nullptr);
+    if (nowTs < ts || (nowTs - ts) > NONCE_EXPIRY_SEC) return false;
+    for (const auto& record : nonceList) if (record.nonce == nonce) return false;
+    if (wasCommandHandled(nonce)) return false;
+    return true;
+}
+
+void rememberNonce(const String& nonce, uint32_t ts) {
+    if (nonce.length() == 0) return;
+    uint32_t nowTs = (uint32_t)time(nullptr);
+    for (auto it = nonceList.begin(); it != nonceList.end(); ) {
+        if (nowTs - it->timestamp > NONCE_EXPIRY_SEC) it = nonceList.erase(it);
+        else ++it;
+    }
+    nonceList.push_back({nonce, nowTs});
+    if (nonceList.size() > MAX_NONCES) nonceList.erase(nonceList.begin());
+}
+
+void cleanupNonces() {
+    uint32_t nowTs = (uint32_t)time(nullptr);
+    for (auto it = nonceList.begin(); it != nonceList.end(); ) {
+        if (nowTs - it->timestamp > NONCE_EXPIRY_SEC) it = nonceList.erase(it);
+        else ++it;
+    }
+}
+
+// ============================ Lưu trữ (SD/SPIFFS) ============================
+File openStorageFile(const String& path, bool writeMode) {
+    if (sdReady && CFG.sdEnabled) return SD.open(path, writeMode ? FILE_WRITE : FILE_READ);
+    return SPIFFS.open(path, writeMode ? FILE_WRITE : FILE_READ);
+}
+
+bool openStorageWrite(const String& path, const String& content) {
+    File f = openStorageFile(path, true);
+    if (!f) return false;
+    f.print(content);
+    f.flush();
+    f.close();
+    return true;
+}
+
+bool openStorageRemove(const String& path) {
+    if (sdReady && CFG.sdEnabled) return SD.remove(path);
+    return SPIFFS.remove(path);
+}
+
+uint32_t getStorageUsedBytes() {
+    uint32_t total = 0;
+    File dir = (sdReady && CFG.sdEnabled) ? SD.open(BACKLOG_DIR) : SPIFFS.open(BACKLOG_DIR);
+    if (!dir) return 0;
+    while (true) {
+        File entry = dir.openNextFile();
+        if (!entry) break;
+        if (!entry.isDirectory()) total += entry.size();
+        entry.close();
+    }
+    dir.close();
+    return total;
+}
+
+uint32_t getBacklogCount() {
+    uint32_t count = 0;
+    File dir = (sdReady && CFG.sdEnabled) ? SD.open(BACKLOG_DIR) : SPIFFS.open(BACKLOG_DIR);
+    if (!dir) return 0;
+    while (true) {
+        File entry = dir.openNextFile();
+        if (!entry) break;
+        if (!entry.isDirectory()) count++;
+        entry.close();
+    }
+    dir.close();
+    return count;
+}
+
+bool backlogHasRoom() {
+    if (sdReady && CFG.sdEnabled) return getStorageUsedBytes() < MAX_BACKLOG_BYTES_SD;
+    return getBacklogCount() < MAX_BACKLOG_FILES_SPIFFS;
+}
+
+String makeBacklogPath() {
+    uint32_t ts = isTimeValid() ? (uint32_t)time(nullptr) : (uint32_t)(millis() / 1000UL);
+    return String(BACKLOG_DIR) + "/" + String(ts) + "_" + genPayloadId() + ".json";
+}
+
+bool saveToOfflineStorage(const String& body) {
+    if (sdReady && CFG.sdEnabled) {
+        if (getStorageUsedBytes() > MAX_BACKLOG_BYTES_SD) return false;
+    } else {
+        if (getBacklogCount() >= MAX_BACKLOG_FILES_SPIFFS) return false;
+    }
+    String path = makeBacklogPath();
+    bool ok = openStorageWrite(path, body);
+    Serial.println(ok ? ("[STORAGE] Saved offline: " + path) : ("[STORAGE] Save failed: " + path));
+    return ok;
+}
+
+bool parseBacklogTimestamp(const String& path, uint32_t& tsOut) {
+    String name = path;
+    int slash = name.lastIndexOf('/');
+    if (slash >= 0) name = name.substring(slash + 1);
+    int underscore = name.indexOf('_');
+    if (underscore <= 0) return false;
+    String tsStr = name.substring(0, underscore);
+    tsOut = (uint32_t)tsStr.toInt();
+    return tsOut > 0;
+}
+
+static bool resetOutboundWindowIfNeeded() {
+    unsigned long nowMs = millis();
+    if (outboundWindowStartMs == 0 || (nowMs - outboundWindowStartMs) >= 60000UL) {
+        outboundWindowStartMs = nowMs;
+        outboundWindowCount = 0;
+    }
+    return true;
+}
+
+bool allowOutboundRequest() {
+    resetOutboundWindowIfNeeded();
+    if (outboundWindowCount >= RATE_LIMIT_PER_DEVICE) {
+        Serial.println("[RATE] outbound limit reached");
+        return false;
+    }
+    outboundWindowCount++;
+    return true;
+}
+
+bool extractJsonTimestamp(JsonVariantConst v, uint32_t& tsOut) {
+    tsOut = 0;
+    if (v.isNull()) return false;
+    if (v.is<JsonObjectConst>()) {
+        JsonObjectConst obj = v.as<JsonObjectConst>();
+        if (obj.containsKey("timestamp")) tsOut = obj["timestamp"] | 0UL;
+        else if (obj.containsKey("ts")) tsOut = obj["ts"] | 0UL;
+        else if (obj.containsKey("created_at")) tsOut = obj["created_at"] | 0UL;
+        else if (obj.containsKey("event_ts")) tsOut = obj["event_ts"] | 0UL;
+        else return false;
+    } else if (v.is<unsigned long>() || v.is<long>() || v.is<int>() || v.is<uint32_t>()) {
+        tsOut = v.as<uint32_t>();
+    } else if (v.is<const char*>() || v.is<String>()) {
+        String s = v.as<String>();
+        tsOut = (uint32_t)s.toInt();
+    } else return false;
+    return tsOut > 0;
+}
+
+bool isWithinReplayWindow(JsonVariantConst v) {
+    uint32_t ts = 0;
+    if (!extractJsonTimestamp(v, ts)) return true;
+    if (!isTimeValid()) return true;
+    uint32_t nowTs = (uint32_t)time(nullptr);
+    if (nowTs < ts) return false;
+    return (nowTs - ts) <= REPLAY_WINDOW_SEC;
+}
+
+bool isCommandExpired(JsonObjectConst cmd) {
+    uint32_t ts = 0;
+    if (!extractJsonTimestamp(cmd, ts)) return false;
+    if (!isTimeValid()) return false;
+    uint32_t nowTs = (uint32_t)time(nullptr);
+    if (nowTs < ts) return true;
+    return (nowTs - ts) > (COMMAND_TTL_MS / 1000UL);
+}
+
+String eventLogPath(const String& tag) {
+    uint32_t ts = isTimeValid() ? (uint32_t)time(nullptr) : (uint32_t)(millis() / 1000UL);
+    return String(ARCHIVE_DIR) + "/" + String(ts) + "_" + tag + "_" + genPayloadId() + ".log";
+}
+
+void logEvent(const String& entityId, const String& eventType, const String& payload, const String& source) {
+    DynamicJsonDocument doc(512);
+    doc["ts"] = getCurrentUTCTimestamp();
+    doc["entity_id"] = entityId;
+    doc["event_type"] = eventType;
+    doc["source"] = source;
+    String payloadSafe = payload;
+    if (payloadSafe.length() > MAX_EVENT_LOG_SIZE) payloadSafe = payloadSafe.substring(0, MAX_EVENT_LOG_SIZE);
+    doc["payload"] = payloadSafe;
+    String line;
+    serializeJson(doc, line);
+    line += "\n";
+    File f = openStorageFile(eventLogPath(eventType), true);
+    if (f) {
+        f.print(line);
+        f.close();
+        eventLogWriteCount++;
+    }
+}
+
+void cleanupArchiveData() {
+    File dir = (sdReady && CFG.sdEnabled) ? SD.open(ARCHIVE_DIR) : SPIFFS.open(ARCHIVE_DIR);
+    if (!dir) return;
+    std::vector<String> paths;
+    uint32_t nowEpoch = (uint32_t)time(nullptr);
+    bool timeValid = isTimeValid();
+    while (true) {
+        File entry = dir.openNextFile();
+        if (!entry) break;
+        if (!entry.isDirectory()) {
+            String path = String(ARCHIVE_DIR) + "/" + String(entry.name());
+            if (entry.size() > 250 * 1024) openStorageRemove(path);
+            else if (timeValid) {
+                uint32_t fileTs = 0;
+                if (parseBacklogTimestamp(path, fileTs)) {
+                    uint32_t ageDays = (nowEpoch > fileTs) ? ((nowEpoch - fileTs) / 86400UL) : 0;
+                    if (ageDays > DYN_CFG.max_data_age_days) {
+                        openStorageRemove(path);
+                        entry.close();
+                        continue;
+                    }
+                }
+                paths.push_back(path);
+            } else paths.push_back(path);
+        }
+        entry.close();
+    }
+    dir.close();
+    if (paths.size() > MAX_BACKLOG_FILES_SPIFFS) {
+        std::sort(paths.begin(), paths.end());
+        size_t extra = paths.size() - MAX_BACKLOG_FILES_SPIFFS;
+        for (size_t i = 0; i < extra; i++) openStorageRemove(paths[i]);
+    }
+}
+
+// ============================ MQTT ============================
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    String message;
+    for (unsigned int i = 0; i < length; i++) message += (char)payload[i];
+    Serial.printf("[MQTT] Received on %s: %s\n", topic, message.c_str());
+    DynamicJsonDocument doc(2048);
+    if (deserializeJson(doc, message) != DeserializationError::Ok) {
+        Serial.println("[MQTT] Invalid JSON");
+        return;
+    }
+    if (!doc.containsKey("payload") || !doc.containsKey("signature")) {
+        Serial.println("[MQTT] Missing payload/signature");
+        return;
+    }
+    JsonObject payloadObj = doc["payload"].as<JsonObject>();
+    String signature = doc["signature"].as<String>();
+    String canonicalPayload = canonicalStringify(payloadObj.as<JsonVariantConst>());
+    String expectedSig = computeHmacSha256(canonicalPayload, String(CFG.hmacSecret));
+    if (signature != expectedSig) {
+        Serial.println("[MQTT] HMAC invalid");
+        return;
+    }
+    String nonce = payloadObj["_nonce"] | "";
+    uint32_t ts = payloadObj["_ts"] | 0;
+    String did = payloadObj["_did"] | "";
+    if (did != CFG.deviceId) {
+        Serial.println("[MQTT] Wrong device ID");
+        return;
+    }
+    if (!isNonceValid(did, nonce, ts)) {
+        Serial.println("[MQTT] Nonce invalid or replay");
+        return;
+    }
+    if (payloadObj.containsKey("commands") && payloadObj["commands"].is<JsonArray>()) {
+        for (JsonObject cmd : payloadObj["commands"].as<JsonArray>()) {
+            String command = cmd["command"] | "";
+            String commandId = cmd["command_id"] | "";
+            JsonVariant params = cmd["params"];
+            if (commandId.length() && !wasCommandHandled(commandId)) {
+                executeLocalCommand(command, params, commandId);
+            }
+        }
+    }
+    rememberNonce(nonce, ts);
+}
+
+void mqttPublishSensorData(const String& payload) {

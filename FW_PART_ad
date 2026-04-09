@@ -1,0 +1,400 @@
+                        Serial.println("[RULE] Triggered: " + rule.action + " | sensor=" + reading.sensor_type + " value=" + String(reading.value, 2));
+                        if (rule.action == "relay1_on") digitalWrite(RELAY_PIN1, RELAY_ACTIVE_LEVEL);
+                        else if (rule.action == "relay1_off") digitalWrite(RELAY_PIN1, RELAY_INACTIVE_LEVEL);
+                        else if (rule.action == "relay2_on") digitalWrite(RELAY_PIN2, RELAY_ACTIVE_LEVEL);
+                        else if (rule.action == "relay2_off") digitalWrite(RELAY_PIN2, RELAY_INACTIVE_LEVEL);
+                        else if (rule.action == "relay3_on") digitalWrite(RELAY_PIN3, RELAY_ACTIVE_LEVEL);
+                        else if (rule.action == "relay3_off") digitalWrite(RELAY_PIN3, RELAY_INACTIVE_LEVEL);
+                        else if (rule.action == "relay4_on") digitalWrite(RELAY_PIN4, RELAY_ACTIVE_LEVEL);
+                        else if (rule.action == "relay4_off") digitalWrite(RELAY_PIN4, RELAY_INACTIVE_LEVEL);
+                    }
+                }
+            } else { state.lastValue = reading.value; }
+        } else {
+            state.triggeredAtMs = 0;
+            if (state.active && recoveredBand && (state.lastActionMs == 0 || (nowMs - state.lastActionMs) >= RULE_COOLDOWN_MS)) {
+                state.active = false;
+                state.lastActionMs = nowMs;
+                state.lastValue = reading.value;
+                Serial.println("[RULE] Reset: " + rule.action + " | sensor=" + reading.sensor_type);
+            }
+        }
+    }
+}
+
+void clearActiveBatches() { activeBatches.clear(); }
+void clearRules() { controlRules.clear(); }
+
+bool loadRules() {
+    if (!wifiConnected()) return false;
+    String url = String(CFG.getBatchUrl) + "?action=get_batch_info&device_id=" + String(CFG.deviceId) + "&api_key=" + String(CFG.apiKey);
+    String payload;
+    if (!fetchWithRetry(url, payload, 3)) return false;
+    DynamicJsonDocument doc(8192);
+    if (deserializeJson(doc, payload) != DeserializationError::Ok) {
+        Serial.println("[RULES] JSON parse failed");
+        return false;
+    }
+    if (!doc.containsKey("payload") || !doc.containsKey("signature")) {
+        Serial.println("[RULES] missing payload/signature");
+        return false;
+    }
+    JsonObject payloadObj = doc["payload"].as<JsonObject>();
+    String signature = doc["signature"].as<String>();
+    String canonicalPayload = canonicalStringify(payloadObj.as<JsonVariantConst>());
+    String expectedSig = computeHmacSha256(canonicalPayload, String(CFG.hmacSecret));
+    if (signature != expectedSig) {
+        Serial.println("[RULES] HMAC invalid");
+        return false;
+    }
+    String nonce = payloadObj["_nonce"] | "";
+    uint32_t ts = payloadObj["_ts"] | 0;
+    String did = payloadObj["_did"] | "";
+    if (did != CFG.deviceId) {
+        Serial.println("[RULES] wrong device id");
+        return false;
+    }
+    if (!isNonceValid(did, nonce, ts)) {
+        Serial.println("[RULES] nonce invalid or replay");
+        return false;
+    }
+    clearActiveBatches();
+    clearRules();
+    if (payloadObj.containsKey("batches") && payloadObj["batches"].is<JsonArray>()) {
+        for (JsonObject b : payloadObj["batches"].as<JsonArray>()) {
+            Batch batch;
+            batch.batch_id = b["batch_id"] | "";
+            batch.type = b["type"] | "";
+            batch.start_date = b["start_date"] | "";
+            batch.end_date = b["end_date"] | "";
+            batch.status = b["status"] | "";
+            batch.zone = b["zone"] | "";
+            batch.force_send = b["force_send"] | false;
+            if (batch.batch_id.length()) activeBatches.push_back(batch);
+        }
+    }
+    if (payloadObj.containsKey("config") && payloadObj["config"].is<JsonObject>() && payloadObj["config"]["rules"].is<JsonArray>()) {
+        for (JsonObject r : payloadObj["config"]["rules"].as<JsonArray>()) {
+            ControlRule rule;
+            rule.zone = r["zone"] | "";
+            rule.sensor = r["sensor"] | "";
+            rule.minVal = r["min"] | 0.0f;
+            rule.maxVal = r["max"] | 0.0f;
+            rule.hysteresis = r["hysteresis"] | 0.0f;
+            rule.durationSec = r["duration_sec"] | 0UL;
+            rule.action = r["action"] | "";
+            if (rule.sensor.length() && rule.action.length()) controlRules.push_back(rule);
+        }
+    } else if (payloadObj.containsKey("rules") && payloadObj["rules"].is<JsonArray>()) {
+        for (JsonObject r : payloadObj["rules"].as<JsonArray>()) {
+            ControlRule rule;
+            rule.zone = r["zone"] | "";
+            rule.sensor = r["sensor"] | "";
+            rule.minVal = r["min"] | 0.0f;
+            rule.maxVal = r["max"] | 0.0f;
+            rule.hysteresis = r["hysteresis"] | 0.0f;
+            rule.durationSec = r["duration_sec"] | 0UL;
+            rule.action = r["action"] | "";
+            if (rule.sensor.length() && rule.action.length()) controlRules.push_back(rule);
+        }
+    }
+    rememberNonce(nonce, ts);
+    Serial.printf("[RULES] batches=%u rules=%u\n", (unsigned)activeBatches.size(), (unsigned)controlRules.size());
+    touchActivity();
+    return true;
+}
+
+void executeLocalCommand(const String& command, JsonVariant params, const String& commandId) {
+    if (wasCommandHandled(commandId)) return;
+    String note = "ok";
+    bool handled = true;
+    if (command == "relay1_on") digitalWrite(RELAY_PIN1, RELAY_ACTIVE_LEVEL);
+    else if (command == "relay1_off") digitalWrite(RELAY_PIN1, RELAY_INACTIVE_LEVEL);
+    else if (command == "relay2_on") digitalWrite(RELAY_PIN2, RELAY_ACTIVE_LEVEL);
+    else if (command == "relay2_off") digitalWrite(RELAY_PIN2, RELAY_INACTIVE_LEVEL);
+    else if (command == "relay3_on") digitalWrite(RELAY_PIN3, RELAY_ACTIVE_LEVEL);
+    else if (command == "relay3_off") digitalWrite(RELAY_PIN3, RELAY_INACTIVE_LEVEL);
+    else if (command == "relay4_on") digitalWrite(RELAY_PIN4, RELAY_ACTIVE_LEVEL);
+    else if (command == "relay4_off") digitalWrite(RELAY_PIN4, RELAY_INACTIVE_LEVEL);
+    else if (command == "reboot") {
+        rememberCommandId(commandId);
+        delay(300);
+        ESP.restart();
+        return;
+    }
+    else if (command == "set_deep_sleep") {
+        if (params.is<JsonObject>() && params["enabled"].is<bool>()) {
+            DYN_CFG.deep_sleep_enabled = params["enabled"] | false;
+            CFG.deepSleepEnabled = DYN_CFG.deep_sleep_enabled;
+            saveConfig();
+            logEvent(String(CFG.deviceId), "config_change", "{\"key\":\"deep_sleep_enabled\"}", "remote");
+        } else { note = "missing_params"; handled = false; }
+    }
+    else if (command == "set_profile") { note = "profile_stub"; logEvent(String(CFG.deviceId), "profile_stub", "set_profile", "remote"); }
+    else if (command == "maintenance_on") maintenanceMode = true;
+    else if (command == "maintenance_off") maintenanceMode = false;
+    else if (command == "capture_media_stub") captureMediaStub();
+    else if (command == "post_blockchain_stub") {
+        String snapshot = params.is<JsonObject>() ? String(params["snapshot"] | "") : "";
+        postToBlockchain(snapshot, String(CFG.deviceId));
+    }
+    else { note = "unsupported_command"; handled = false; }
+    rememberCommandId(commandId);
+    METRICS.commandExecCount++;
+    touchActivity();
+    DynamicJsonDocument payload(1024);
+    payload["event_type"] = "command_result";
+    payload["command_id"] = commandId;
+    payload["command"] = command;
+    payload["status"] = handled ? "success" : "partial";
+    payload["note"] = note;
+    payload["device_id"] = String(CFG.deviceId);
+    payload["fw_version"] = FW_VERSION;
+    payload["ts"] = getCurrentUTCTimestamp();
+    String payloadJson;
+    serializeJson(payload, payloadJson);
+    reportCommandResult(commandId, command, handled ? "success" : "partial", note);
+    logEvent(String(CFG.deviceId), "command_exec", command + "|" + commandId + "|" + (handled ? "success" : "partial") + "|" + note, "remote");
+}
+
+bool fetchCommands() {
+    if (!wifiConnected()) return false;
+    String url = getConfigUrl() + "?action=get_pending_commands&device_id=" + String(CFG.deviceId) + "&api_key=" + String(CFG.apiKey);
+    String payload;
+    if (!fetchWithRetry(url, payload, 3)) return false;
+    DynamicJsonDocument doc(8192);
+    if (deserializeJson(doc, payload) != DeserializationError::Ok) {
+        Serial.println("[CMD] JSON parse failed");
+        return false;
+    }
+    if (!doc.containsKey("payload") || !doc.containsKey("signature")) {
+        Serial.println("[CMD] missing payload/signature");
+        return false;
+    }
+    JsonObject payloadObj = doc["payload"].as<JsonObject>();
+    String signature = doc["signature"].as<String>();
+    String canonicalPayload = canonicalStringify(payloadObj.as<JsonVariantConst>());
+    String expectedSig = computeHmacSha256(canonicalPayload, String(CFG.hmacSecret));
+    if (signature != expectedSig) {
+        Serial.println("[CMD] HMAC invalid");
+        return false;
+    }
+    String nonce = payloadObj["_nonce"] | "";
+    uint32_t ts = payloadObj["_ts"] | 0;
+    String did = payloadObj["_did"] | "";
+    if (did != CFG.deviceId) {
+        Serial.println("[CMD] wrong device id");
+        return false;
+    }
+    if (!isNonceValid(did, nonce, ts)) {
+        Serial.println("[CMD] nonce invalid or replay");
+        return false;
+    }
+    if (!payloadObj.containsKey("commands") || !payloadObj["commands"].is<JsonArray>()) {
+        touchActivity();
+        rememberNonce(nonce, ts);
+        return true;
+    }
+    for (JsonObject cmd : payloadObj["commands"].as<JsonArray>()) {
+        String command = cmd["command"] | "";
+        String commandId = cmd["command_id"] | "";
+        JsonVariant params = cmd["params"];
+        if (commandId.length() == 0) continue;
+        if (wasCommandHandled(commandId)) continue;
+        if (isCommandExpired(cmd)) {
+            logEvent(String(CFG.deviceId), "command_expired", commandId + "|" + command, "remote");
+            continue;
+        }
+        executeLocalCommand(command, params, commandId);
+    }
+    rememberNonce(nonce, ts);
+    touchActivity();
+    return true;
+}
+
+// ============================ Payloads ============================
+String buildHeartbeatPayload() {
+    DynamicJsonDocument doc(1024);
+    doc["action"] = "heartbeat";
+    doc["device_id"] = String(CFG.deviceId);
+    doc["fw_version"] = FW_VERSION;
+    doc["uptime_sec"] = (uint32_t)(millis() / 1000);
+    doc["rssi"] = wifiConnected() ? WiFi.RSSI() : -127;
+    doc["battery_v"] = readBatteryVoltage();
+    doc["backlog_count"] = getBacklogCount();
+    doc["free_heap"] = ESP.getFreeHeap();
+    doc["config_version"] = DYN_CFG.config_version;
+    doc["post_interval_sec"] = DYN_CFG.post_interval_sec;
+    doc["sensor_interval_sec"] = DYN_CFG.sensor_interval_sec;
+    doc["deep_sleep_enabled"] = DYN_CFG.deep_sleep_enabled;
+    String out;
+    serializeJson(doc, out);
+    return out;
+}
+
+void appendReading(JsonArray readings, const SensorReading& s) {
+    if (!isValidReading(s)) return;
+    JsonObject o = readings.createNestedObject();
+    o["sensor_type"] = s.sensor_type;
+    o["value"] = s.value;
+    o["unit"] = s.unit;
+    o["sensor_id"] = s.sensor_id;
+    o["zone"] = s.zone;
+    o["event_ts"] = s.event_ts;
+    o["local_time"] = s.local_time;
+}
+
+String buildSensorPayload() {
+    DynamicJsonDocument doc(4096);
+    JsonArray readings = doc.createNestedArray("readings");
+    time_t now = time(nullptr);
+    doc["action"] = "log_data";
+    doc["device_id"] = String(CFG.deviceId);
+    doc["batch_id"] = currentBatchId();
+    doc["zone"] = currentZone();
+    doc["uptime"] = (uint32_t)(millis() / 1000);
+    doc["rssi"] = wifiConnected() ? WiFi.RSSI() : -127;
+    doc["battery_v"] = readBatteryVoltage();
+    doc["backlog_count"] = getBacklogCount();
+    doc["event_ts"] = iso8601UTC(now);
+    doc["local_time"] = iso8601Local(now);
+    SensorReading r;
+    r = readDS18B20(); appendReading(readings, r); processRuleForReading(r);
+    r = readDHT22Temp(); appendReading(readings, r); processRuleForReading(r);
+    r = readDHT22Humidity(); appendReading(readings, r); processRuleForReading(r);
+    r = readSoilMoisture(); appendReading(readings, r); processRuleForReading(r);
+    r = readADSpH(); appendReading(readings, r); processRuleForReading(r);
+    r = readADSTDS(); appendReading(readings, r); processRuleForReading(r);
+    r = readADSDO(); appendReading(readings, r); processRuleForReading(r);
+    float batteryV = readBatteryVoltage();
+    if (batteryV < LOW_BATTERY_THRESHOLD_V) {
+        doc["alert"] = "low_battery";
+        doc["battery_v"] = batteryV;
+        logEvent(String(CFG.deviceId), "alert", "low_battery", "system");
+    }
+    if (batteryV < CRITICAL_BATTERY_THRESHOLD_V) {
+        doc["critical_alert"] = "critical_battery";
+        logEvent(String(CFG.deviceId), "critical_alert", "critical_battery", "system");
+    }
+    // Cảnh báo đất khô
+    for (JsonObject reading : readings) {
+        String type = reading["sensor_type"].as<String>();
+        float val = reading["value"] | NAN;
+        if (type == "soil_moisture" && !isnan(val) && val < SOIL_DRY_THRESHOLD_PERCENT) {
+            doc["alert"] = "soil_dry";
+            logEvent(String(CFG.deviceId), "alert", "soil_dry", "system");
+        }
+    }
+    if (DYN_CFG.ml_anomaly_enabled) {
+        bool highTemp = false;
+        for (JsonObject reading : readings) {
+            String sensorType = reading["sensor_type"].as<String>();
+            float value = reading["value"] | NAN;
+            if (sensorType == "temp" && !isnan(value) && value > TEMP_ANOMALY_THRESHOLD_C) {
+                highTemp = true;
+                break;
+            }
+        }
+        if (highTemp) doc["anomaly"] = "high_temp";
+    }
+    String out;
+    serializeJson(doc, out);
+    return out;
+}
+
+void cacheLatestSensorPayload(const String& payload) {
+    LAST_SENSOR_PAYLOAD = payload;
+    LAST_SENSOR_PAYLOAD_AT = millis();
+    LAST_SENSOR_PAYLOAD_VALID = true;
+}
+
+bool sendSensorDataNow(const String& payload) {
+    bool ok = false;
+    if (wifiConnected()) {
+        if (sendWrappedJSON(payload)) ok = true;
+        else if (backlogHasRoom()) saveToOfflineStorage(payload);
+    } else {
+        if (backlogHasRoom()) saveToOfflineStorage(payload);
+    }
+    if (DYN_CFG.mqtt_enabled && mqttConnected) mqttPublishSensorData(payload);
+    return ok;
+}
+
+void processHeartbeatLoop() {
+    String hb = buildHeartbeatPayload();
+    METRICS.heartbeatCount++;
+    logEvent(String(CFG.deviceId), "heartbeat", hb, "system");
+    if (wifiConnected()) {
+        if (!sendWrappedJSON(hb)) {
+            if (backlogHasRoom()) saveToOfflineStorage(hb);
+        }
+    } else {
+        if (backlogHasRoom()) saveToOfflineStorage(hb);
+    }
+    if (DYN_CFG.mqtt_enabled && mqttConnected) mqttPublishHeartbeat();
+    touchActivity();
+}
+
+void processSensorLoop() {
+    String payload = buildSensorPayload();
+    cacheLatestSensorPayload(payload);
+    logEvent(String(CFG.deviceId), "sensor_payload", payload, "system");
+    if (!sendSensorDataNow(payload)) Serial.println("[SENSOR] stored offline or dropped (no room)");
+    touchActivity();
+}
+
+// ============================ OTA ============================
+bool checkOTA() {
+    if (!wifiConnected()) return false;
+    String url = getOtaUrl() + "?action=ota_check&device_id=" + String(CFG.deviceId) + "&api_key=" + String(CFG.apiKey);
+    String payload;
+    if (!fetchWithRetry(url, payload, 3)) return false;
+    DynamicJsonDocument doc(4096);
+    if (deserializeJson(doc, payload) != DeserializationError::Ok) return false;
+    if (!doc.containsKey("payload") || !doc.containsKey("signature")) return false;
+    JsonObject payloadObj = doc["payload"].as<JsonObject>();
+    String signature = doc["signature"].as<String>();
+    String canonicalPayload = canonicalStringify(payloadObj.as<JsonVariantConst>());
+    String expectedSig = computeHmacSha256(canonicalPayload, String(CFG.hmacSecret));
+    if (signature != expectedSig) {
+        Serial.println("[OTA] HMAC invalid");
+        METRICS.otaFailCount++;
+        return false;
+    }
+    String nonce = payloadObj["_nonce"] | "";
+    uint32_t ts = payloadObj["_ts"] | 0;
+    String did = payloadObj["_did"] | "";
+    if (did != CFG.deviceId) {
+        Serial.println("[OTA] wrong device id");
+        return false;
+    }
+    if (!isNonceValid(did, nonce, ts)) {
+        Serial.println("[OTA] nonce invalid or replay");
+        return false;
+    }
+    JsonObject manifest;
+    if (payloadObj.containsKey("manifest") && payloadObj["manifest"].is<JsonObject>())
+        manifest = payloadObj["manifest"].as<JsonObject>();
+    else manifest = payloadObj.as<JsonObject>();
+    bool updateAvailable = manifest["update_available"] | false;
+    String version = manifest["version"] | "";
+    if (!updateAvailable || version == FW_VERSION) return false;
+    String binUrl = manifest["bin_url"] | "";
+    String expectedSha256 = manifest["sha256"] | "";
+    uint32_t size = manifest["size"] | 0;
+    if (binUrl.isEmpty()) return false;
+    WiFiClientSecure client;
+    client.setInsecure();
+    HTTPClient http;
+    http.setTimeout(20000);
+    if (!http.begin(client, binUrl)) return false;
+    int code = http.GET();
+    if (code != HTTP_CODE_OK) {
+        http.end();
+        METRICS.otaFailCount++;
+        return false;
+    }
+    int len = http.getSize();
+    if (size > 0 && len > 0 && len != (int)size) {
+        Serial.println("[OTA] size mismatch");
+        http.end();
